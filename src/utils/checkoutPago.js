@@ -50,16 +50,21 @@ export async function checkoutAmountsForIframe(selectedPlan, vehiculo) {
     cplan: DEMO_CHECKOUT_PLAN_ID,
     ccategoria_uso: codes.ccategoria_uso,
   })
+
+  const cascoAnual = selectedPlan?.casco?.primaAnual || 0
+  const mprimaext = (Number(cot?.mprimaext) || 0) + cascoAnual
+  const mprima = (Number(cot?.mprima) || 0) + (cascoAnual * (Number(cot?.ptasa) || 1))
+
   return {
     ...checkoutAmountsFromPlan({
       ...selectedPlan,
       cotizacion: cot,
       prima: {
         ...(selectedPlan?.prima || {}),
-        mprima: cot?.mprima,
-        mprimaext: cot?.mprimaext,
+        mprima,
+        mprimaext,
         ptasa: cot?.ptasa,
-        anual: cot?.mprimaext,
+        anual: mprimaext,
       },
     }),
     demoPlanId: DEMO_CHECKOUT_PLAN_ID,

@@ -205,9 +205,9 @@ export async function buildEmissionAutoPayload({
     fdesde: emision,
     fhasta: hasta,
     cusuario: PLANES_V2_REQUEST.cusuario,
-    msumaaseg: 0,
-    mprima: 0,
-    mprimaext: 0,
-    ptasa: 0,
+    msumaaseg: toNumberOr(plan?.casco?.sumaAsegurada ?? 0, 0),
+    mprima: toNumberOr(plan?.prima?.mprima ?? 0, 0),
+    mprimaext: toNumberOr(plan?.prima?.mprimaext ?? plan?.prima?.anual ?? 0, 0),
+    ptasa: toNumberOr(plan?.prima?.ptasa ?? 0, 0),
   }
 }

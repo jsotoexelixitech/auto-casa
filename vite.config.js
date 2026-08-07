@@ -1,16 +1,19 @@
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 import { VitePWA } from 'vite-plugin-pwa'
 import basicSsl from '@vitejs/plugin-basic-ssl'
 
-const useTunnel = process.env.USE_TUNNEL === '1'
-/* VITE_HTTPS=1 activa un certificado autofirmado para servir en HTTPS.
-   Imprescindible cuando se accede al dev server por IP LAN (ej.
-   192.168.x.x) porque la Geolocation API solo funciona en contextos
-   seguros (HTTPS o localhost). */
-const useHttps = process.env.VITE_HTTPS === '1'
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), '')
+  const useTunnel = process.env.USE_TUNNEL === '1'
+  /* VITE_HTTPS=1 activa un certificado autofirmado para servir en HTTPS.
+     Imprescindible cuando se accede al dev server por IP LAN (ej.
+     192.168.x.x) porque la Geolocation API solo funciona en contextos
+     seguros (HTTPS o localhost). */
+  const useHttps = process.env.VITE_HTTPS === '1'
+  const valrepTarget = env.VITE_VALREP_API_TARGET || 'http://192.168.8.120:3002'
 
-export default defineConfig({
+  return {
   plugins: [
     react(),
     ...(useHttps ? [basicSsl()] : []),
@@ -107,7 +110,7 @@ export default defineConfig({
       },
       // Valrep (planes y otros endpoints futuros) — base: …/api/v1
       '/valrep-api': {
-        target: 'http://192.168.8.120:3002',
+        target: valrepTarget,
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/valrep-api/, '/api/v1'),
       },
@@ -127,4 +130,5 @@ export default defineConfig({
       ? { protocol: 'wss', clientPort: 443 }
       : true,
   },
+  }
 })

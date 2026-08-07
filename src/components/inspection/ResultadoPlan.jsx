@@ -152,12 +152,15 @@ export default function ResultadoPlan({
   /** @type {Record<string, { status: string, list?: Array<{cvalor:string,xdescripcion:string}>, error?: string }>} */
   const [frecuenciasByPlan, setFrecuenciasByPlan] = useState({})
   const [frecuenciaSel, setFrecuenciaSel] = useState(null)
+  const [cascoSel, setCascoSel] = useState(null)
+  const [sumaAsegurada, setSumaAsegurada] = useState(0)
 
   useEffect(() => {
     userPickedRef.current = false
     setCotizacionByPlan({})
     setFrecuenciasByPlan({})
     setFrecuenciaSel(null)
+    setCascoSel(null)
   }, [sourceKey])
 
   useEffect(() => {
@@ -165,15 +168,39 @@ export default function ResultadoPlan({
     if (!userPickedRef.current) setPlanSel(planSugerido)
   }, [planSugerido])
 
-  // Al cambiar de plan, volver a Anual (la prima API es anual)
+  // Al cambiar de plan, volver a Anual (la prima API es anual) y reiniciar casco
   useEffect(() => {
     setFrecuenciaSel(null)
+    setCascoSel(null)
   }, [planSel?.id])
+
+  // Inicializar suma asegurada según plan sugerido/seleccionado
+  useEffect(() => {
+    if (!planSel) return
+    const cot = cotizacionByPlan[planSel.id]
+    if (cot?.prima?.referenceSuma) {
+      setSumaAsegurada(cot.prima.referenceSuma)
+      return
+    }
+    const match = String(planSel.nombre || '').match(/(\d+[\.\d]*)\s*k?\$/i)
+    let defSuma = 5000
+    if (match) {
+      let val = parseFloat(match[1].replace(/\./g, ''))
+      if (val < 100) val = val * 1000
+      defSuma = val
+    } else {
+      if (planSel.id === 'AutoIV') defSuma = 7000
+      else if (planSel.id === 'AutoV') defSuma = 10000
+      else if (planSel.id === 'Auto') defSuma = 5000
+      else if (planSel.id === 'AutoII') defSuma = 2000
+    }
+    setSumaAsegurada(defSuma)
+  }, [planSel?.id, cotizacionByPlan[planSel?.id]?.prima?.referenceSuma])
 
   // Si Anual está disponible y no hay selección, marcarla (también con frecuencias en caché)
   useEffect(() => {
     if (frecuenciaSel) return
-    const list = (frecuenciasByPlan[planSel?.id]?.list || []).filter((f) => isFrecuenciaAnual(f))
+    const list = (frecuenciasByPlan[planSel?.id]?.list || [])
     if (!list?.length) return
     setFrecuenciaSel(pickDefaultFrecuencia(list)?.cvalor ?? list[0].cvalor)
   }, [planSel?.id, frecuenciasByPlan, frecuenciaSel])
@@ -206,18 +233,17 @@ export default function ResultadoPlan({
     ;(async () => {
       const freqPromise = freqReady
         ? Promise.resolve(
-            (frecuenciasByPlan[planId]?.list || []).filter((f) => isFrecuenciaAnual(f)),
+            (frecuenciasByPlan[planId]?.list || []),
           )
         : fetchFrecuencias(planId)
             .then((list) => {
               if (cancelled) return []
-              // Solo frecuencia anual (omitir semestral, trimestral, etc.)
-              const anualOnly = (Array.isArray(list) ? list : []).filter((f) => isFrecuenciaAnual(f))
+              const allFrequencies = Array.isArray(list) ? list : []
               setFrecuenciasByPlan((prev) => ({
                 ...prev,
-                [planId]: { status: 'ready', list: anualOnly },
+                [planId]: { status: 'ready', list: allFrequencies },
               }))
-              return anualOnly
+              return allFrequencies
             })
             .catch((err) => {
               if (cancelled) return []
@@ -250,6 +276,8 @@ export default function ResultadoPlan({
                 mprima: data?.mprima,
                 ptasa: data?.ptasa,
                 mprimaext: data?.mprimaext,
+                rates: data?.rates,
+                referenceSuma: data?.referenceSuma,
               })
               setCotizacionByPlan((prev) => ({
                 ...prev,
@@ -310,12 +338,19 @@ export default function ResultadoPlan({
     if (!planSel) return
     const cot = cotizacionByPlan[planSel.id]
     const freq = frecuenciasByPlan[planSel.id]
-    const frecuencias = (freq?.list || []).filter((f) => isFrecuenciaAnual(f))
+    const frecuencias = (freq?.list || [])
     const frecuencia = frecuencias.find((f) => f.cvalor === frecuenciaSel) || null
     const primaAnual = Number(cot?.prima?.anual ?? cot?.prima?.monto ?? planSel.prima?.anual ?? planSel.prima?.monto)
+    
+    // Calcular prima de casco con tasas dinámicas
+    const dynamicRates = cot?.prima?.rates || { CA: 9.32, PT: 6.52, PP: 3.50 }
+    const pctTasa = cascoSel ? (dynamicRates[cascoSel] / 100) : 0
+    const primaCascoAnual = Number(sumaAsegurada) * pctTasa
+    const totalPrimaAnual = (Number.isFinite(primaAnual) ? primaAnual : 0) + primaCascoAnual
+
     const cuota = frecuencia
-      ? cuotaFromPrimaAnual(primaAnual, frecuencia)
-      : (Number.isFinite(primaAnual) ? primaAnual : undefined)
+      ? cuotaFromPrimaAnual(totalPrimaAnual, frecuencia)
+      : (Number.isFinite(totalPrimaAnual) ? totalPrimaAnual : undefined)
 
     const cplanApi = String(planSel.raw?.cplan ?? planSel.cplan ?? '').trim()
     const base = {
@@ -333,10 +368,19 @@ export default function ResultadoPlan({
         ...base,
         prima: {
           ...cot.prima,
-          monto: cuota ?? cot.prima.monto,
+          monto: cuota ?? totalPrimaAnual,
           cuota,
-          anual: cot.prima.anual ?? cot.prima.monto,
+          anual: totalPrimaAnual,
+          mprimaext: totalPrimaAnual,
+          mprima: totalPrimaAnual * (cot.prima?.ptasa ?? 1),
         },
+        casco: cascoSel ? {
+          cobertura: cascoSel,
+          nombre: cascoSel === 'CA' ? 'COBERTURA AMPLIA' : (cascoSel === 'PT' ? 'PERDIDA TOTAL' : 'PERDIDA PARCIAL'),
+          tasa: dynamicRates[cascoSel],
+          sumaAsegurada,
+          primaAnual: primaCascoAnual,
+        } : null,
         inmaMatched: cot.matched,
         inmaCodes: cot.codes || null,
         cotizacion: cot.raw,
@@ -344,7 +388,7 @@ export default function ResultadoPlan({
       return
     }
     onPlanChange?.(base)
-  }, [planSel, cotizacionByPlan, frecuenciasByPlan, frecuenciaSel, onPlanChange])
+  }, [planSel, cotizacionByPlan, frecuenciasByPlan, frecuenciaSel, cascoSel, sumaAsegurada, onPlanChange])
 
   // Efecto máquina de escribir solo tras una generación nueva (no al reusar caché)
   const awaitGenerationRef = useRef(!diagnosisIsCurrent)
@@ -616,13 +660,19 @@ export default function ResultadoPlan({
             const prima = cot?.prima || planSel.prima || {}
             const cotizando = cot?.status === 'loading'
             const cotError = cot?.status === 'error'
-            const freqs = (frecuenciasByPlan[planSel.id]?.list || []).filter((f) => isFrecuenciaAnual(f))
+            const freqs = (frecuenciasByPlan[planSel.id]?.list || [])
             const frecuencia =
               freqs.find((f) => f.cvalor === frecuenciaSel) || pickDefaultFrecuencia(freqs)
-            const primaAnual = Number(prima.anual ?? prima.monto)
+            
+            const basePrimaAnual = Number(prima.anual ?? prima.monto)
+            const dynamicRates = prima.rates || { CA: 9.32, PT: 6.52, PP: 3.50 }
+            const pctTasa = cascoSel ? (dynamicRates[cascoSel] / 100) : 0
+            const primaCascoAnual = Number(sumaAsegurada) * pctTasa
+            const totalPrimaAnual = (Number.isFinite(basePrimaAnual) ? basePrimaAnual : 0) + primaCascoAnual
+
             const monto = frecuencia
-              ? cuotaFromPrimaAnual(primaAnual, frecuencia)
-              : primaAnual
+              ? cuotaFromPrimaAnual(totalPrimaAnual, frecuencia)
+              : totalPrimaAnual
             const montoLabel = cotizando
               ? '…'
               : Number.isFinite(monto)
@@ -633,6 +683,12 @@ export default function ResultadoPlan({
                 ? 'Prima anual'
                 : `Cuota ${String(frecuencia.xdescripcion || '').toLowerCase()}`)
               : 'Prima'
+
+            const cascoOptions = [
+              { key: 'CA', nombre: 'COBERTURA AMPLIA', tasa: dynamicRates.CA },
+              { key: 'PT', nombre: 'PERDIDA TOTAL', tasa: dynamicRates.PT },
+              { key: 'PP', nombre: 'PERDIDA PARCIAL', tasa: dynamicRates.PP },
+            ]
 
             return (
               <div
@@ -656,7 +712,70 @@ export default function ResultadoPlan({
                     <p className="text-sm text-white/70 mt-0.5 leading-snug">
                       {planSel.subtitulo}
                     </p>
+                    {frecuencia && (
+                      <p className="text-[10px] text-white/70 uppercase tracking-wider font-semibold">
+                        {primaCaption}
+                      </p>
+                    )}
                   </div>
+                </div>
+
+                {/* Sección Cobertura de Casco */}
+                <div className="relative pt-3 border-t border-white/20 flex flex-col gap-3">
+                  <div>
+                    <p className="text-[11px] font-bold uppercase tracking-wider text-white/70 mb-2">
+                      Incluir Cobertura de Casco:
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      {cascoOptions.map((item) => {
+                        const sel = cascoSel === item.key
+                        return (
+                          <button
+                            key={item.key}
+                            type="button"
+                            onClick={() => setCascoSel(sel ? null : item.key)}
+                            className={clsx(
+                              'rounded-full px-3 py-1.5 border transition-all text-[10px] sm:text-[11px] font-bold flex items-center gap-1.5',
+                              sel
+                                ? 'border-[#ffdedf] bg-[#ffdedf] text-[#b23f44] shadow-sm font-black'
+                                : 'border-white/20 bg-white/10 text-white/80 hover:bg-white/15 hover:border-white/35',
+                            )}
+                          >
+                            {sel && <Icon name="check" className="text-[13px]" filled />}
+                            {item.nombre}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  {cascoSel && (
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] font-bold uppercase tracking-wider text-white/60">
+                          Suma Asegurada ($)
+                        </label>
+                        <input
+                          type="number"
+                          value={sumaAsegurada || ''}
+                          onChange={(e) => {
+                            const val = Math.max(0, parseInt(e.target.value) || 0)
+                            setSumaAsegurada(val)
+                          }}
+                          className="w-full bg-white/15 border border-white/20 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-white/50 transition-colors"
+                          placeholder="Suma"
+                        />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] font-bold uppercase tracking-wider text-white/60">
+                          Tasa (%)
+                        </label>
+                        <div className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/70 select-none font-semibold">
+                          {String(Number(dynamicRates[cascoSel]).toFixed(2)).replace('.', ',')} %
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 <div className="relative bg-white/10 rounded-xl px-4 py-6 text-center backdrop-blur min-w-0">
@@ -683,7 +802,7 @@ export default function ResultadoPlan({
 
                 {(() => {
                   const freqState = frecuenciasByPlan[planSel.id]
-                  const freqsList = (freqState?.list || []).filter((f) => isFrecuenciaAnual(f))
+                  const freqsList = (freqState?.list || [])
                   const freqLoading = freqState?.status === 'loading'
                   if (freqLoading) {
                     return (
