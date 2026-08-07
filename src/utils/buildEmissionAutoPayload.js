@@ -148,6 +148,10 @@ export async function buildEmissionAutoPayload({
   // `plan` de createEmissionAuto = cplan exacto de planes/v2 (sin transformar).
   const cplan = String(plan?.raw?.cplan ?? plan?.cplan ?? '').trim()
 
+  // Cobertura casco del paso 5: claves de rates en cotización (CA | PT | PP).
+  const coberAdicional = String(plan?.casco?.cobertura ?? '').trim().toUpperCase()
+  const tasaCasco = toNumberOr(plan?.casco?.tasa, 0)
+
   return {
     poliza: null,
     cramo: COTIZACION_DEFAULTS.cramo ?? 18,
@@ -209,5 +213,10 @@ export async function buildEmissionAutoPayload({
     mprima: toNumberOr(plan?.prima?.mprima ?? 0, 0),
     mprimaext: toNumberOr(plan?.prima?.mprimaext ?? plan?.prima?.anual ?? 0, 0),
     ptasa: toNumberOr(plan?.prima?.ptasa ?? 0, 0),
+    itipoEmi: 'NU',
+    coberAdicional: coberAdicional || null,
+    tasaPt: coberAdicional === 'PT' ? tasaCasco : 0,
+    tasaPp: coberAdicional === 'PP' ? tasaCasco : 0,
+    tasaCa: coberAdicional === 'CA' ? tasaCasco : 0,
   }
 }

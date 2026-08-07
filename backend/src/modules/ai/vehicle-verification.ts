@@ -293,8 +293,8 @@ export function enforceVehicleVerification(
   return out;
 }
 
-/** Temporal: no marcar "otro" solo por discrepancia de placa vs paso 1. */
-export const DISABLE_PLATE_STEP1_MATCH = true;
+/** Si es true, no marca "otro" solo por discrepancia de placa vs paso 1. */
+export const DISABLE_PLATE_STEP1_MATCH = false;
 
 function isPlateOnlyRejectionMotivo(
   motivo?: string | null,

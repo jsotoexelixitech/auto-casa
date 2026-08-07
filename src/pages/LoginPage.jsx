@@ -35,7 +35,7 @@ export default function LoginPage() {
     } catch (err) {
       const msg =
         err?.status === 401 || err?.status === 400
-          ? 'Email o contraseña incorrectos. Usa Demo1234! para usuarios de prueba.'
+          ? 'Email o contraseña incorrectos.'
           : err?.message ?? 'Credenciales inválidas'
       toast.error(msg, { title: 'Error de acceso' })
     } finally {

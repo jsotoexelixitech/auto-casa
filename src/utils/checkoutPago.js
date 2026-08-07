@@ -6,12 +6,6 @@ import { splitDocumentoVe } from './buildEmissionAutoPayload'
 import { fetchCotizacion } from '../services/valrepApi'
 import { resolveInmaVehicle } from './resolveInmaVehicle'
 
-/**
- * TEMP (pruebas de pago): el iframe SSO cotiza este cplan internamente.
- * UI / emisión siguen con el plan elegido por el usuario.
- */
-export const DEMO_CHECKOUT_PLAN_ID = 'RCVPR2'
-
 function round2(n) {
   return Math.round(Number(n) * 100) / 100
 }
@@ -37,17 +31,24 @@ export function checkoutAmountsFromPlan(plan) {
 }
 
 /**
- * Montos para el iframe: cotiza `DEMO_CHECKOUT_PLAN_ID` y aplica la frecuencia
- * del plan seleccionado en UI. Emisión / resumen visual no usan esto.
+ * Montos para el iframe: cotiza el `cplan` seleccionado y aplica la frecuencia
+ * del plan en UI, sumando la prima de casco elegida.
  */
 export async function checkoutAmountsForIframe(selectedPlan, vehiculo) {
+  const cplan = String(
+    selectedPlan?.raw?.cplan ?? selectedPlan?.cplan ?? selectedPlan?.id ?? '',
+  ).trim()
+  if (!cplan) {
+    throw new Error('Selecciona un plan válido antes de pagar.')
+  }
+
   const codes = await resolveInmaVehicle(vehiculo)
   const cot = await fetchCotizacion({
     cmarca: codes.cmarca,
     cmodelo: codes.cmodelo,
     cversion: codes.cversion,
     fano: codes.fano,
-    cplan: DEMO_CHECKOUT_PLAN_ID,
+    cplan,
     ccategoria_uso: codes.ccategoria_uso,
   })
 
@@ -67,8 +68,8 @@ export async function checkoutAmountsForIframe(selectedPlan, vehiculo) {
         anual: mprimaext,
       },
     }),
-    demoPlanId: DEMO_CHECKOUT_PLAN_ID,
-    cotizacionDemo: cot,
+    planId: cplan,
+    cotizacion: cot,
   }
 }
 

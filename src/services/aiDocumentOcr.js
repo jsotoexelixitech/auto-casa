@@ -57,7 +57,7 @@ export async function extractDocumentOcr(imageData, docType) {
       }
       if (err.status === 401) {
         throw new Error(
-          'Sesión requerida — inicia sesión con tu correo y contraseña Demo1234! para usar el OCR.',
+          'Sesión requerida — inicia sesión para usar el OCR.',
         )
       }
       if (

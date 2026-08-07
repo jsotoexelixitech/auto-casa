@@ -6,8 +6,8 @@
 
 
 
-/** Temporal: no rechazar fotos por discrepancia de placa foto ↔ datos del paso 1. */
-export const DISABLE_PLATE_STEP1_MATCH = true
+/** Si es true, no rechaza fotos solo por discrepancia de placa foto ↔ paso 1. */
+export const DISABLE_PLATE_STEP1_MATCH = false
 
 export const VEHICLE_MATCH_STATUS = {
 

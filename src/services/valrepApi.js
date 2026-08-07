@@ -1,10 +1,22 @@
 /**
- * Cliente Valrep / INMA (API externa La Mundial).
+ * Cliente Valrep / INMA (API externa La Mundial / nest-api).
  * Base: VITE_VALREP_API_URL  (ej. http://192.168.8.120:3002/api/v1 o /valrep-api)
+ * Auth (NEST_AUTH_USE_TOKEN=true):
+ *   1) POST /auth/token  body { apikey, grant_type: 'api_key' }
+ *   2) Authorization: Bearer <access_token>
+ *   3) POST /auth/refresh con refresh_token al vencer
  */
 import { parseEmissionAutoResponse } from '../utils/emissionResult'
 
 const VALREP_BASE = (import.meta.env.VITE_VALREP_API_URL ?? '').replace(/\/$/, '')
+const VALREP_API_KEY = String(import.meta.env.VITE_VALREP_API_KEY ?? '').trim()
+/** Margen antes de expires_in para renovar (ms). */
+const TOKEN_SKEW_MS = 30_000
+
+/** @type {{ accessToken: string, refreshToken: string, expiresAt: number } | null} */
+let tokenSession = null
+/** @type {Promise<string> | null} */
+let tokenInFlight = null
 
 /** Parámetros fijos iniciales del listado de planes (ajustables cuando se parametrice). */
 export const PLANES_V2_REQUEST = {
@@ -31,24 +43,158 @@ export class ValrepApiError extends Error {
   }
 }
 
+function rememberTokens(payload) {
+  const accessToken = String(payload?.access_token ?? '').trim()
+  if (!accessToken) {
+    throw new ValrepApiError(401, 'Valrep no devolvió access_token')
+  }
+  const expiresInSec = Number(payload?.expires_in)
+  const ttlMs = Number.isFinite(expiresInSec) && expiresInSec > 0
+    ? expiresInSec * 1000
+    : 900_000
+  tokenSession = {
+    accessToken,
+    refreshToken: String(payload?.refresh_token ?? '').trim(),
+    expiresAt: Date.now() + ttlMs,
+  }
+  return accessToken
+}
+
+async function exchangeApiKeyForTokens() {
+  if (!VALREP_API_KEY) {
+    throw new ValrepApiError(0, 'VITE_VALREP_API_KEY no está configurada')
+  }
+  let res
+  try {
+    res = await fetch(`${VALREP_BASE}/auth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grant_type: 'api_key', apikey: VALREP_API_KEY }),
+    })
+  } catch {
+    throw new ValrepApiError(0, 'No se pudo conectar con Valrep (auth/token)')
+  }
+  const json = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    const msg = json?.message || json?.error || `HTTP ${res.status}`
+    throw new ValrepApiError(res.status, typeof msg === 'string' ? msg : 'Error auth Valrep')
+  }
+  return rememberTokens(json?.data ?? json)
+}
+
+async function refreshAccessToken() {
+  const refreshToken = tokenSession?.refreshToken
+  if (!refreshToken) {
+    return exchangeApiKeyForTokens()
+  }
+  let res
+  try {
+    res = await fetch(`${VALREP_BASE}/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    })
+  } catch {
+    return exchangeApiKeyForTokens()
+  }
+  const json = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    tokenSession = null
+    return exchangeApiKeyForTokens()
+  }
+  return rememberTokens(json?.data ?? json)
+}
+
+async function ensureAccessToken({ force = false } = {}) {
+  if (!VALREP_BASE) {
+    throw new ValrepApiError(0, 'VITE_VALREP_API_URL no está configurada')
+  }
+  if (!force && tokenSession?.accessToken && Date.now() < tokenSession.expiresAt - TOKEN_SKEW_MS) {
+    return tokenSession.accessToken
+  }
+  if (tokenInFlight) return tokenInFlight
+
+  tokenInFlight = (async () => {
+    try {
+      if (force || !tokenSession?.accessToken) {
+        return await exchangeApiKeyForTokens()
+      }
+      if (Date.now() >= tokenSession.expiresAt - TOKEN_SKEW_MS) {
+        return await refreshAccessToken()
+      }
+      return tokenSession.accessToken
+    } finally {
+      tokenInFlight = null
+    }
+  })()
+
+  return tokenInFlight
+}
+
+async function valrepHeaders({ forceToken = false } = {}) {
+  const headers = { 'Content-Type': 'application/json' }
+  if (VALREP_API_KEY) {
+    const accessToken = await ensureAccessToken({ force: forceToken })
+    headers.Authorization = `Bearer ${accessToken}`
+  }
+  return headers
+}
+
+function isAuthFailure(status, json) {
+  if (status !== 401) return false
+  const msg = String(json?.message || json?.error || '').toLowerCase()
+  return (
+    msg.includes('access_token')
+    || msg.includes('token')
+    || msg.includes('autentic')
+    || msg.includes('unauthorized')
+    || !msg
+  )
+}
+
+async function valrepFetch(url, { method, body, connectError }) {
+  let headers = await valrepHeaders()
+  let res
+  try {
+    res = await fetch(url, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    })
+  } catch {
+    throw new ValrepApiError(0, connectError)
+  }
+
+  let json = await res.json().catch(() => ({}))
+
+  if (VALREP_API_KEY && isAuthFailure(res.status, json)) {
+    headers = await valrepHeaders({ forceToken: true })
+    try {
+      res = await fetch(url, {
+        method,
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      })
+    } catch {
+      throw new ValrepApiError(0, connectError)
+    }
+    json = await res.json().catch(() => ({}))
+  }
+
+  return { res, json }
+}
+
 async function valrepRequest(method, path, body) {
   if (!VALREP_BASE) {
     throw new ValrepApiError(0, 'VITE_VALREP_API_URL no está configurada')
   }
 
   const url = `${VALREP_BASE}${path.startsWith('/') ? path : `/${path}`}`
-  let res
-  try {
-    res = await fetch(url, {
-      method,
-      headers: { 'Content-Type': 'application/json' },
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    })
-  } catch {
-    throw new ValrepApiError(0, 'No se pudo conectar con Valrep')
-  }
-
-  const json = await res.json().catch(() => ({}))
+  const { res, json } = await valrepFetch(url, {
+    method,
+    body,
+    connectError: 'No se pudo conectar con Valrep',
+  })
 
   if (!res.ok) {
     const msg = json?.message || json?.error || `HTTP ${res.status}`
@@ -149,21 +295,14 @@ export async function validateEmissionAuto(placa, serial_carroceria) {
   }
 
   const url = `${VALREP_BASE}/external/validateEmissionAuto`
-  let res
-  try {
-    res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        placa: String(placa ?? '').trim(),
-        serial_carroceria: String(serial_carroceria ?? '').trim(),
-      }),
-    })
-  } catch {
-    throw new ValrepApiError(0, 'No se pudo conectar con el servicio de validación')
-  }
-
-  const json = await res.json().catch(() => ({}))
+  const { res, json } = await valrepFetch(url, {
+    method: 'POST',
+    body: {
+      placa: String(placa ?? '').trim(),
+      serial_carroceria: String(serial_carroceria ?? '').trim(),
+    },
+    connectError: 'No se pudo conectar con el servicio de validación',
+  })
 
   if (!res.ok) {
     const msg = pickEmissionMessage(json?.result, json, json?.data) || `HTTP ${res.status}`
@@ -200,18 +339,11 @@ export async function createEmissionAuto(payload) {
   }
 
   const url = `${VALREP_BASE}/external/createEmissionAuto`
-  let res
-  try {
-    res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    })
-  } catch {
-    throw new ValrepApiError(0, 'No se pudo conectar con el servicio de emisión')
-  }
-
-  const json = await res.json().catch(() => ({}))
+  const { res, json } = await valrepFetch(url, {
+    method: 'POST',
+    body: payload,
+    connectError: 'No se pudo conectar con el servicio de emisión',
+  })
 
   if (!res.ok) {
     const msg = pickEmissionMessage(json?.result, json, json?.data) || `HTTP ${res.status}`

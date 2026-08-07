@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import clsx from 'clsx'
 import Icon from '../ui/Icon'
 import { PLAN_TONES, BRAND, getAnalisisGradientTone } from '../../theme/tokens'
@@ -8,7 +8,7 @@ import {
   getIaDiagnosticoSourceKey,
 } from '../../utils/generateIaDiagnostico'
 import { fetchPlanesV2, fetchCotizacion, fetchFrecuencias } from '../../services/valrepApi'
-import { mapValrepPlanesToUi, selectTopPlanesFromIa } from '../../utils/mapValrepPlanes'
+import { mapValrepPlanesToUi, selectTopPlanesFromIa, parseSumaAsegurada } from '../../utils/mapValrepPlanes'
 import { resolveInmaVehicle, primaFromMprimaext } from '../../utils/resolveInmaVehicle'
 import {
   pickDefaultFrecuencia,
@@ -28,6 +28,212 @@ const SELECTED_ITEM_TONE = {
   bg: '#ffdedf', // secondary-fixed
   fg: '#b23f44', // secondary
   border: '#b23f44',
+}
+
+const CASCO_KEYS = ['CA', 'PT', 'PP']
+
+const CASCO_NOMBRES = {
+  CA: 'COBERTURA AMPLIA',
+  PT: 'PERDIDA TOTAL',
+  PP: 'PERDIDA PARCIAL',
+}
+
+/** Cobertura de casco sugerida según el plan IA (misma lógica de recomendación). */
+function pickDefaultCasco(iaPlan) {
+  const id = iaPlan?.id || ''
+  if (id === 'perdida_total') return 'PT'
+  if (id === 'rcv') return 'PP'
+  return 'CA'
+}
+
+/** Formato moneda USD con decimales (es-VE: 7.000,50). */
+function formatSumaDisplay(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) return ''
+  const hasDecimals = Math.abs(n % 1) > 1e-9
+  return n.toLocaleString('es-VE', {
+    minimumFractionDigits: hasDecimals ? 2 : 0,
+    maximumFractionDigits: 2,
+  })
+}
+
+function countDigits(str = '') {
+  return String(str).replace(/\D/g, '').length
+}
+
+/** Posición de caret tras N dígitos en `str` (0 = inicio). */
+function caretPosAfterDigits(str, digitCount) {
+  if (digitCount <= 0) return 0
+  let seen = 0
+  for (let i = 0; i < str.length; i += 1) {
+    if (/\d/.test(str[i])) {
+      seen += 1
+      if (seen >= digitCount) return i + 1
+    }
+  }
+  return str.length
+}
+
+function valueHasDecimals(value) {
+  const n = Number(value)
+  return Number.isFinite(n) && Math.abs(n % 1) > 1e-9
+}
+
+/**
+ * ¿El texto pide modo decimal?
+ * - `,` → sí
+ * - `.` final (teclado numérico) → sí
+ * - Si ya estábamos en decimal y queda `entero.d` con grupos de miles válidos → sí
+ * - `8.52` al borrar miles (sin haber escrito decimal) → NO (son enteros)
+ */
+function resolveSumaDecimalMode(raw, prevMode, { maxDecimals = 2 } = {}) {
+  const s = String(raw ?? '').replace(/[^\d.,]/g, '')
+  if (!s) return false
+  if (s.includes(',')) return true
+  if (s.endsWith('.')) return true
+
+  if (!prevMode || !s.includes('.')) return false
+
+  // Mantener decimal solo si el último punto parece decimal con miles bien formados:
+  // "7.000.5" sí · "8.52" no (grupo incompleto de miles al borrar)
+  const parts = s.split('.')
+  const last = parts[parts.length - 1]
+  if (last.length === 0 || last.length > maxDecimals) return false
+  const middle = parts.slice(1, -1)
+  if (middle.some((p) => p.length !== 3)) return false
+  // Con un solo punto ("852.5") y prevMode: el usuario escribió el decimal
+  if (parts.length === 2) return true
+  // Varios puntos: el penúltimo grupo debe ser miles completo (3)
+  return parts[parts.length - 2]?.length === 3
+}
+
+/**
+ * Parsea input es-VE. En modo entero los `.` son solo miles (nunca decimal).
+ * @returns {{ value: number|null, display: string, decimalMode: boolean }}
+ */
+function parseSumaInput(raw, { maxDecimals = 2, decimalMode: prevMode = false } = {}) {
+  const cleaned = String(raw ?? '').trim().replace(/[^\d.,]/g, '')
+  if (!cleaned) return { value: null, display: '', decimalMode: false }
+
+  const decimalMode = resolveSumaDecimalMode(cleaned, prevMode, { maxDecimals })
+
+  let intDigits = ''
+  let decDigits = ''
+  let trailingComma = false
+
+  if (decimalMode) {
+    let s = cleaned
+    if (!s.includes(',') && s.endsWith('.')) {
+      s = `${s.slice(0, -1)},`
+    } else if (!s.includes(',') && s.includes('.')) {
+      const parts = s.split('.')
+      const last = parts[parts.length - 1]
+      const intPart = parts.slice(0, -1).join('.')
+      s = `${intPart},${last}`
+    }
+
+    const idx = s.indexOf(',')
+    if (idx >= 0) {
+      intDigits = s.slice(0, idx).replace(/\D/g, '')
+      decDigits = s.slice(idx + 1).replace(/\D/g, '').slice(0, maxDecimals)
+      trailingComma = s.endsWith(',') && decDigits === ''
+    } else {
+      intDigits = s.replace(/\D/g, '')
+    }
+  } else {
+    // Solo enteros: ignorar puntos/comas residuales de la máscara
+    intDigits = cleaned.replace(/\D/g, '')
+  }
+
+  if (!intDigits && !decDigits && !trailingComma) {
+    return { value: null, display: '', decimalMode: false }
+  }
+
+  const intNum = Number(intDigits || '0')
+  if (!Number.isFinite(intNum)) return { value: null, display: '', decimalMode: false }
+
+  const normalized = decDigits
+    ? `${intDigits || '0'}.${decDigits}`
+    : (intDigits || '0')
+  const value = Number(normalized)
+  if (!Number.isFinite(value)) return { value: null, display: '', decimalMode: false }
+
+  const intDisp = intNum.toLocaleString('es-VE')
+  let display = intDisp
+  if (trailingComma) display += ','
+  else if (decDigits) display += `,${decDigits}`
+
+  return {
+    value,
+    display,
+    decimalMode: Boolean(trailingComma || decDigits),
+  }
+}
+
+/** Normaliza montos del endpoint (7000 | "7.000" | "7000,00" | "7.000,00"). */
+function parseEndpointSuma(raw) {
+  if (raw == null || raw === '') return null
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+    return Math.round(raw * 100) / 100
+  }
+  const s = String(raw).trim().replace(/[$\s]/g, '')
+  if (!s) return null
+  // 7.000,00 / 7000,00 → quitar miles y usar coma decimal
+  if (/^\d{1,3}(\.\d{3})+(,\d+)?$/.test(s)) {
+    const normalized = s.replace(/\./g, '').replace(',', '.')
+    const n = Number(normalized)
+    return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : null
+  }
+  if (/^\d+(,\d+)?$/.test(s)) {
+    const n = Number(s.replace(',', '.'))
+    return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : null
+  }
+  if (/^\d+(\.\d+)?$/.test(s)) {
+    const n = Number(s)
+    return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : null
+  }
+  const digits = s.replace(/\D/g, '')
+  const n = Number(digits)
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+
+function pickSumaFromCotizacion(cot) {
+  if (!cot) return null
+  const raw = cot.raw && typeof cot.raw === 'object' ? cot.raw : {}
+  const prima = cot.prima && typeof cot.prima === 'object' ? cot.prima : {}
+  const rates = (prima.rates || raw.rates || {})
+  const candidates = [
+    prima.referenceSuma,
+    raw.referenceSuma,
+    raw.msumaaseg,
+    raw.mSumaAseg,
+    raw.sumaAsegurada,
+    raw.suma_asegurada,
+    raw.suma,
+    rates.referenceSuma,
+    rates.msumaaseg,
+    rates.sumaAsegurada,
+  ]
+  for (const c of candidates) {
+    const n = parseEndpointSuma(c)
+    if (n != null) return n
+  }
+  return null
+}
+
+function pickSumaFromPlan(plan) {
+  const fromNivel = Number(plan?.nivelPlan)
+  if (Number.isFinite(fromNivel) && fromNivel > 0) return Math.round(fromNivel)
+  return (
+    parseSumaAsegurada(plan?.nombre)
+    || parseSumaAsegurada(plan?.subtitulo)
+    || null
+  )
+}
+
+function isValidSumaAsegurada(value) {
+  const n = Number(value)
+  return Number.isFinite(n) && n > 0
 }
 
 export default function ResultadoPlan({
@@ -51,6 +257,8 @@ export default function ResultadoPlan({
   setValrepPlanesStatus,
   valrepPlanesError = '',
   setValrepPlanesError,
+  /** Incrementar desde el wizard cuando falle la validación al pulsar Siguiente. */
+  sumaValidationTick = 0,
 }) {
   const {
     plan: iaPlan,
@@ -152,50 +360,150 @@ export default function ResultadoPlan({
   /** @type {Record<string, { status: string, list?: Array<{cvalor:string,xdescripcion:string}>, error?: string }>} */
   const [frecuenciasByPlan, setFrecuenciasByPlan] = useState({})
   const [frecuenciaSel, setFrecuenciaSel] = useState(null)
-  const [cascoSel, setCascoSel] = useState(null)
+  const cascoSugerido = useMemo(() => pickDefaultCasco(iaPlan), [iaPlan?.id])
+  const [cascoSel, setCascoSel] = useState(() => pickDefaultCasco(iaPlan))
   const [sumaAsegurada, setSumaAsegurada] = useState(0)
+  const [sumaDisplay, setSumaDisplay] = useState('')
+  const [sumaTouched, setSumaTouched] = useState(false)
+  /** Valor de referencia (endpoint cotización → fallback plan). */
+  const [sumaDefault, setSumaDefault] = useState(null)
+  const [sumaEdited, setSumaEdited] = useState(false)
+  /** true solo si el usuario/API introdujo decimales de forma explícita (no al borrar miles). */
+  const [sumaDecimalMode, setSumaDecimalMode] = useState(false)
+  const sumaUserEditedRef = useRef(false)
+  const lastSumaPlanIdRef = useRef(null)
+  const sumaInputRef = useRef(null)
+  /** @type {React.MutableRefObject<{ inDecimals: boolean, digitCount: number, atComma?: boolean } | null>} */
+  const sumaCaretRef = useRef(null)
+
+  useLayoutEffect(() => {
+    const el = sumaInputRef.current
+    const caret = sumaCaretRef.current
+    if (!el || !caret || document.activeElement !== el) return
+    const text = el.value || ''
+    const commaIdx = text.indexOf(',')
+    let pos
+    if (caret.inDecimals) {
+      if (commaIdx < 0) {
+        pos = text.length
+      } else {
+        pos = commaIdx + 1 + caretPosAfterDigits(text.slice(commaIdx + 1), caret.digitCount)
+      }
+    } else {
+      const intPart = commaIdx >= 0 ? text.slice(0, commaIdx) : text
+      pos = caretPosAfterDigits(intPart, caret.digitCount)
+      // Si el usuario estaba justo en la coma, mantenerlo ahí
+      if (caret.atComma && commaIdx >= 0) pos = commaIdx
+    }
+    const safe = Math.max(0, Math.min(pos, text.length))
+    el.setSelectionRange(safe, safe)
+    sumaCaretRef.current = null
+  }, [sumaDisplay])
 
   useEffect(() => {
     userPickedRef.current = false
     setCotizacionByPlan({})
     setFrecuenciasByPlan({})
     setFrecuenciaSel(null)
-    setCascoSel(null)
-  }, [sourceKey])
+    setCascoSel(pickDefaultCasco(iaPlan))
+    sumaUserEditedRef.current = false
+    lastSumaPlanIdRef.current = null
+    setSumaEdited(false)
+    setSumaDefault(null)
+    setSumaDecimalMode(false)
+  }, [sourceKey, iaPlan?.id])
 
   useEffect(() => {
     if (!planSugerido) return
     if (!userPickedRef.current) setPlanSel(planSugerido)
   }, [planSugerido])
 
-  // Al cambiar de plan, volver a Anual (la prima API es anual) y reiniciar casco
+  // Al cambiar de plan, volver a Anual (la prima API es anual) y cobertura sugerida
   useEffect(() => {
     setFrecuenciaSel(null)
-    setCascoSel(null)
-  }, [planSel?.id])
+    setCascoSel(pickDefaultCasco(iaPlan))
+    sumaUserEditedRef.current = false
+    setSumaEdited(false)
+    setSumaDecimalMode(false)
+  }, [planSel?.id, iaPlan?.id])
 
-  // Inicializar suma asegurada según plan sugerido/seleccionado
+  // Cobertura obligatoria: si se pierde la selección, restaurar la sugerida
   useEffect(() => {
-    if (!planSel) return
+    if (CASCO_KEYS.includes(cascoSel)) return
+    setCascoSel(cascoSugerido)
+  }, [cascoSel, cascoSugerido])
+
+  // Default editable: endpoint (cotización) → nivel/nombre del plan
+  useEffect(() => {
+    if (!planSel?.id) return
     const cot = cotizacionByPlan[planSel.id]
-    if (cot?.prima?.referenceSuma) {
-      setSumaAsegurada(cot.prima.referenceSuma)
+    const fromApi = cot?.status === 'ready' ? pickSumaFromCotizacion(cot) : null
+    const fromPlan = pickSumaFromPlan(planSel)
+    const next = fromApi ?? fromPlan
+    const planChanged = lastSumaPlanIdRef.current !== planSel.id
+
+    if (planChanged) {
+      lastSumaPlanIdRef.current = planSel.id
+      sumaUserEditedRef.current = false
+      setSumaEdited(false)
+    }
+
+    // No pisar edición manual del usuario
+    if (sumaUserEditedRef.current && !planChanged) {
+      // Sí actualizar la referencia del endpoint si llega después
+      if (fromApi != null) setSumaDefault(fromApi)
       return
     }
-    const match = String(planSel.nombre || '').match(/(\d+[\.\d]*)\s*k?\$/i)
-    let defSuma = 5000
-    if (match) {
-      let val = parseFloat(match[1].replace(/\./g, ''))
-      if (val < 100) val = val * 1000
-      defSuma = val
-    } else {
-      if (planSel.id === 'AutoIV') defSuma = 7000
-      else if (planSel.id === 'AutoV') defSuma = 10000
-      else if (planSel.id === 'Auto') defSuma = 5000
-      else if (planSel.id === 'AutoII') defSuma = 2000
+    // Esperar cotización lista si aún no hay fallback de plan
+    if (next == null && cot?.status === 'loading') return
+    if (next == null) {
+      setSumaAsegurada(0)
+      setSumaDisplay('')
+      setSumaTouched(false)
+      setSumaDefault(null)
+      setSumaDecimalMode(false)
+      return
     }
-    setSumaAsegurada(defSuma)
-  }, [planSel?.id, cotizacionByPlan[planSel?.id]?.prima?.referenceSuma])
+    // Si ya mostramos el del plan y llega el del API, actualizar solo si el usuario no editó
+    setSumaDefault(fromApi ?? fromPlan)
+    setSumaAsegurada(next)
+    setSumaDisplay(formatSumaDisplay(next))
+    setSumaTouched(false)
+    setSumaEdited(false)
+    setSumaDecimalMode(valueHasDecimals(next))
+  }, [
+    planSel?.id,
+    planSel?.nombre,
+    planSel?.nivelPlan,
+    cotizacionByPlan[planSel?.id]?.status,
+    cotizacionByPlan[planSel?.id]?.prima?.referenceSuma,
+    cotizacionByPlan[planSel?.id]?.raw,
+  ])
+
+  useEffect(() => {
+    if (!sumaValidationTick) return
+    setSumaTouched(true)
+  }, [sumaValidationTick])
+
+  const sumaInvalid = !isValidSumaAsegurada(sumaAsegurada)
+  const sumaDefaultNum = Number(sumaDefault)
+  const canResetSuma = Boolean(
+    sumaEdited
+    && Number.isFinite(sumaDefaultNum)
+    && sumaDefaultNum > 0
+    && Math.abs(Number(sumaAsegurada) - sumaDefaultNum) > 1e-9,
+  )
+
+  const resetSumaToDefault = () => {
+    if (!Number.isFinite(sumaDefaultNum) || sumaDefaultNum <= 0) return
+    sumaUserEditedRef.current = false
+    setSumaEdited(false)
+    setSumaAsegurada(sumaDefaultNum)
+    setSumaDisplay(formatSumaDisplay(sumaDefaultNum))
+    setSumaDecimalMode(valueHasDecimals(sumaDefaultNum))
+    setSumaTouched(false)
+    sumaCaretRef.current = null
+  }
 
   // Si Anual está disponible y no hay selección, marcarla (también con frecuencias en caché)
   useEffect(() => {
@@ -272,12 +580,16 @@ export default function ResultadoPlan({
                 ccategoria_uso: codes.ccategoria_uso,
               })
               if (cancelled) return null
+              const referenceSuma = pickSumaFromCotizacion({
+                raw: data,
+                prima: { rates: data?.rates, referenceSuma: data?.referenceSuma },
+              })
               const prima = primaFromMprimaext(data?.mprimaext, {
                 mprima: data?.mprima,
                 ptasa: data?.ptasa,
                 mprimaext: data?.mprimaext,
                 rates: data?.rates,
-                referenceSuma: data?.referenceSuma,
+                referenceSuma,
               })
               setCotizacionByPlan((prev) => ({
                 ...prev,
@@ -334,7 +646,7 @@ export default function ResultadoPlan({
     vehiculo?.tipo,
   ])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!planSel) return
     const cot = cotizacionByPlan[planSel.id]
     const freq = frecuenciasByPlan[planSel.id]
@@ -353,6 +665,18 @@ export default function ResultadoPlan({
       : (Number.isFinite(totalPrimaAnual) ? totalPrimaAnual : undefined)
 
     const cplanApi = String(planSel.raw?.cplan ?? planSel.cplan ?? '').trim()
+    const sumaOk = isValidSumaAsegurada(sumaAsegurada)
+    const cascoPayload = CASCO_KEYS.includes(cascoSel)
+      ? {
+          cobertura: cascoSel,
+          nombre: CASCO_NOMBRES[cascoSel] || CASCO_NOMBRES.CA,
+          tasa: dynamicRates[cascoSel],
+          sumaAsegurada: sumaOk ? Number(sumaAsegurada) : 0,
+          primaAnual: sumaOk ? primaCascoAnual : 0,
+          sugerida: cascoSel === cascoSugerido,
+          sumaValida: sumaOk,
+        }
+      : null
     const base = {
       ...planSel,
       id: cplanApi || planSel.id,
@@ -361,6 +685,7 @@ export default function ResultadoPlan({
       frecuencias,
       frecuencia,
       frecuenciaCodigo: frecuencia?.cvalor ?? frecuenciaSel,
+      casco: cascoPayload,
     }
 
     if (cot?.status === 'ready' && cot.prima) {
@@ -374,13 +699,6 @@ export default function ResultadoPlan({
           mprimaext: totalPrimaAnual,
           mprima: totalPrimaAnual * (cot.prima?.ptasa ?? 1),
         },
-        casco: cascoSel ? {
-          cobertura: cascoSel,
-          nombre: cascoSel === 'CA' ? 'COBERTURA AMPLIA' : (cascoSel === 'PT' ? 'PERDIDA TOTAL' : 'PERDIDA PARCIAL'),
-          tasa: dynamicRates[cascoSel],
-          sumaAsegurada,
-          primaAnual: primaCascoAnual,
-        } : null,
         inmaMatched: cot.matched,
         inmaCodes: cot.codes || null,
         cotizacion: cot.raw,
@@ -388,7 +706,7 @@ export default function ResultadoPlan({
       return
     }
     onPlanChange?.(base)
-  }, [planSel, cotizacionByPlan, frecuenciasByPlan, frecuenciaSel, cascoSel, sumaAsegurada, onPlanChange])
+  }, [planSel, cotizacionByPlan, frecuenciasByPlan, frecuenciaSel, cascoSel, cascoSugerido, sumaAsegurada, onPlanChange])
 
   // Efecto máquina de escribir solo tras una generación nueva (no al reusar caché)
   const awaitGenerationRef = useRef(!diagnosisIsCurrent)
@@ -464,38 +782,38 @@ export default function ResultadoPlan({
       {/* ── Resumen + Diagnóstico IA (mitad / mitad) ───────────────────── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-stretch">
         <div className="card p-4 sm:p-5 flex flex-col" style={{ borderTop: '3px solid #0F1A5A' }}>
-          <h3 className="text-headline-md text-on-surface mb-1 flex items-center gap-2">
-            <Icon name="auto_awesome" className="text-primary text-[22px]" filled />
-            Resumen del análisis
-          </h3>
+        <h3 className="text-headline-md text-on-surface mb-1 flex items-center gap-2">
+          <Icon name="auto_awesome" className="text-primary text-[22px]" filled />
+          Resumen del análisis
+        </h3>
           <p className="text-caption text-on-surface-variant mb-3">
             {zonasAnalizadas.length} zona(s) analizadas · {piezasPresentes} pieza(s) evaluadas
             {piezas.noExiste > 0 ? ` · ${piezas.noExiste} omitidas (no aplican)` : ''}
           </p>
 
           <div className="grid grid-cols-4 gap-1.5 mb-3">
-            <PiezaStat label="Buenas"    value={piezas.buenas}    tone="success" icon="check_circle" />
-            <PiezaStat label="Regulares" value={piezas.regulares} tone="warning" icon="warning" />
-            <PiezaStat label="Malas"     value={piezas.malas}     tone="error"   icon="cancel" />
+          <PiezaStat label="Buenas"    value={piezas.buenas}    tone="success" icon="check_circle" />
+          <PiezaStat label="Regulares" value={piezas.regulares} tone="warning" icon="warning" />
+          <PiezaStat label="Malas"     value={piezas.malas}     tone="error"   icon="cancel" />
             <PiezaStat label="Total"     value={piezasPresentes} tone="neutral" icon="analytics" />
-          </div>
+        </div>
 
           {piezasPresentes > 0 && (
-            <div className="flex h-3 rounded-full overflow-hidden mb-2 gap-0.5">
-              {piezas.buenas > 0 && (
-                <div className="bg-green-500 transition-all rounded-l-full"
+          <div className="flex h-3 rounded-full overflow-hidden mb-2 gap-0.5">
+            {piezas.buenas > 0 && (
+              <div className="bg-green-500 transition-all rounded-l-full"
                   style={{ width: `${(piezas.buenas / denomPct) * 100}%` }} />
-              )}
-              {piezas.regulares > 0 && (
-                <div className="bg-amber-400 transition-all"
+            )}
+            {piezas.regulares > 0 && (
+              <div className="bg-amber-400 transition-all"
                   style={{ width: `${(piezas.regulares / denomPct) * 100}%` }} />
-              )}
-              {piezas.malas > 0 && (
-                <div className="bg-red-500 transition-all rounded-r-full"
+            )}
+            {piezas.malas > 0 && (
+              <div className="bg-red-500 transition-all rounded-r-full"
                   style={{ width: `${(piezas.malas / denomPct) * 100}%` }} />
-              )}
-            </div>
-          )}
+            )}
+          </div>
+        )}
           <div className="flex flex-wrap gap-x-4 gap-y-1 text-caption text-on-surface-variant mb-2">
             <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-green-500 inline-block" /> {pctBuenas}% buenas</span>
             <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-amber-400 inline-block" /> {pctRegulares}% regulares</span>
@@ -571,8 +889,8 @@ export default function ResultadoPlan({
           <p className="text-body-md text-on-surface-variant text-center">
             Consultando planes disponibles…
           </p>
-        </div>
-      )}
+                      </div>
+                    )}
 
       {showPlanesFallbackNote && (
         <div className="rounded-xl px-4 py-3 bg-amber-50 border border-amber-200 text-caption text-amber-900">
@@ -684,11 +1002,12 @@ export default function ResultadoPlan({
                 : `Cuota ${String(frecuencia.xdescripcion || '').toLowerCase()}`)
               : 'Prima'
 
-            const cascoOptions = [
-              { key: 'CA', nombre: 'COBERTURA AMPLIA', tasa: dynamicRates.CA },
-              { key: 'PT', nombre: 'PERDIDA TOTAL', tasa: dynamicRates.PT },
-              { key: 'PP', nombre: 'PERDIDA PARCIAL', tasa: dynamicRates.PP },
-            ]
+            const cascoOptions = CASCO_KEYS.map((key) => ({
+              key,
+              nombre: CASCO_NOMBRES[key],
+              tasa: dynamicRates[key],
+              sugerida: key === cascoSugerido,
+            }))
 
             return (
               <div
@@ -724,7 +1043,7 @@ export default function ResultadoPlan({
                 <div className="relative pt-3 border-t border-white/20 flex flex-col gap-3">
                   <div>
                     <p className="text-[11px] font-bold uppercase tracking-wider text-white/70 mb-2">
-                      Incluir Cobertura de Casco:
+                      Selecciona la cobertura de casco
                     </p>
                     <div className="flex flex-wrap gap-2">
                       {cascoOptions.map((item) => {
@@ -733,7 +1052,7 @@ export default function ResultadoPlan({
                           <button
                             key={item.key}
                             type="button"
-                            onClick={() => setCascoSel(sel ? null : item.key)}
+                            onClick={() => setCascoSel(item.key)}
                             className={clsx(
                               'rounded-full px-3 py-1.5 border transition-all text-[10px] sm:text-[11px] font-bold flex items-center gap-1.5',
                               sel
@@ -743,39 +1062,122 @@ export default function ResultadoPlan({
                           >
                             {sel && <Icon name="check" className="text-[13px]" filled />}
                             {item.nombre}
+                            {item.sugerida && (
+                              <span
+                                className={clsx(
+                                  'text-[8px] font-bold uppercase tracking-wide px-1.5 py-px rounded-full',
+                                  sel ? 'bg-[#b23f44] text-white' : 'bg-white/25 text-white',
+                                )}
+                              >
+                                Sugerida
+                              </span>
+                            )}
                           </button>
                         )
                       })}
                     </div>
-                  </div>
+                </div>
 
-                  {cascoSel && (
-                    <div className="grid grid-cols-2 gap-3">
-                      <div className="flex flex-col gap-1">
-                        <label className="text-[10px] font-bold uppercase tracking-wider text-white/60">
-                          Suma Asegurada ($)
-                        </label>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[10px] font-bold uppercase tracking-wider text-white/60">
+                        Suma Asegurada ($)
+                      </label>
+                      <div
+                        className={clsx(
+                          'flex items-center gap-1 rounded-lg bg-white/15 transition-colors',
+                          sumaTouched && sumaInvalid
+                            ? 'border border-red-300/80 focus-within:border-red-300'
+                            : 'border border-white/20 focus-within:border-white/50',
+                        )}
+                      >
+                        <span className="pl-3 text-sm text-white/60 font-semibold pointer-events-none shrink-0">
+                          $
+                        </span>
                         <input
-                          type="number"
-                          value={sumaAsegurada || ''}
+                          ref={sumaInputRef}
+                          type="text"
+                          inputMode="decimal"
+                          autoComplete="off"
+                          value={sumaDisplay}
                           onChange={(e) => {
-                            const val = Math.max(0, parseInt(e.target.value) || 0)
-                            setSumaAsegurada(val)
+                            sumaUserEditedRef.current = true
+                            setSumaEdited(true)
+                            const input = e.target
+                            const raw = input.value
+                            const caret = input.selectionStart ?? raw.length
+                            const parsed = parseSumaInput(raw, { decimalMode: sumaDecimalMode })
+
+                            // Caret: en display final la decimal es siempre `,`
+                            // Si el usuario escribió `.` decimal, mapear a zona decimal
+                            const rawComma = raw.indexOf(',')
+                            const rawDotDec = (!raw.includes(',') && raw.endsWith('.'))
+                              ? raw.lastIndexOf('.')
+                              : -1
+                            const decSepIdx = rawComma >= 0
+                              ? rawComma
+                              : (parsed.decimalMode && rawDotDec >= 0
+                                ? rawDotDec
+                                : (parsed.decimalMode ? raw.lastIndexOf('.') : -1))
+                            const inDecimals = parsed.decimalMode && decSepIdx >= 0 && caret > decSepIdx
+                            const atComma = parsed.decimalMode && decSepIdx >= 0 && caret === decSepIdx
+                            const digitCount = inDecimals
+                              ? countDigits(raw.slice(decSepIdx + 1, caret))
+                              : countDigits(raw.slice(0, Math.max(0, decSepIdx >= 0 ? decSepIdx : caret)))
+                            sumaCaretRef.current = { inDecimals, digitCount, atComma }
+
+                            setSumaDecimalMode(parsed.decimalMode)
+                            if (parsed.value == null && !parsed.display) {
+                              setSumaAsegurada(0)
+                              setSumaDisplay('')
+                              return
+                            }
+                            setSumaAsegurada(parsed.value ?? 0)
+                            setSumaDisplay(parsed.display)
                           }}
-                          className="w-full bg-white/15 border border-white/20 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-white/50 transition-colors"
-                          placeholder="Suma"
+                          onBlur={() => {
+                            setSumaTouched(true)
+                            sumaCaretRef.current = null
+                            if (isValidSumaAsegurada(sumaAsegurada)) {
+                              setSumaDisplay(formatSumaDisplay(sumaAsegurada))
+                              setSumaDecimalMode(valueHasDecimals(sumaAsegurada))
+                            }
+                          }}
+                          aria-invalid={sumaTouched && sumaInvalid}
+                          className="min-w-0 flex-1 bg-transparent border-0 py-2 pr-1 text-sm text-white tabular-nums focus:outline-none"
+                          placeholder="Ej. 7.000,00"
                         />
+                        {canResetSuma && (
+                          <button
+                            type="button"
+                            onClick={resetSumaToDefault}
+                            className="shrink-0 mr-1 w-8 h-7 rounded-md inline-flex items-center justify-center text-white/85 hover:text-white hover:bg-white/15 transition-colors"
+                            aria-label="Restaurar suma original de cotización"
+                            title="Restaurar valor original de cotización"
+                          >
+                            <Icon name="refresh" className="text-[18px]" />
+                          </button>
+                        )}
                       </div>
-                      <div className="flex flex-col gap-1">
-                        <label className="text-[10px] font-bold uppercase tracking-wider text-white/60">
-                          Tasa (%)
-                        </label>
-                        <div className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/70 select-none font-semibold">
-                          {String(Number(dynamicRates[cascoSel]).toFixed(2)).replace('.', ',')} %
-                        </div>
+                      {sumaTouched && sumaInvalid && (
+                        <p className="text-[10px] text-red-300 font-medium leading-snug">
+                          La suma asegurada es obligatoria y debe ser mayor a 0
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[10px] font-bold uppercase tracking-wider text-white/60">
+                        Tasa (%)
+                      </label>
+                      <div
+                        className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/70 select-none font-semibold"
+                        aria-readonly="true"
+                        title="Tasa definida por la cobertura (no editable)"
+                      >
+                        {String(Number(dynamicRates[cascoSel] ?? dynamicRates.CA).toFixed(2)).replace('.', ',')} %
                       </div>
                     </div>
-                  )}
+                  </div>
                 </div>
 
                 <div className="relative bg-white/10 rounded-xl px-4 py-6 text-center backdrop-blur min-w-0">

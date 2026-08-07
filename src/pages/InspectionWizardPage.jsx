@@ -62,6 +62,7 @@ export default function InspectionWizardPage() {
   const [paymentData, setPaymentData] = useState(null)
   const [selectedPlan, setSelectedPlan] = useState(null)
   const [confirmPlanOpen, setConfirmPlanOpen] = useState(false)
+  const [sumaValidationTick, setSumaValidationTick] = useState(0)
   const [iframeUrl, setIframeUrl] = useState('')
   const [iframeLoading, setIframeLoading] = useState(false)
   const [iframeError, setIframeError] = useState('')
@@ -81,6 +82,64 @@ export default function InspectionWizardPage() {
     planParaPago?.frecuencia?.xdescripcion
     || (typeof planParaPago?.frecuenciaCodigo === 'string' ? planParaPago.frecuenciaCodigo : null)
     || null
+  const coberturaLabel =
+    planParaPago?.casco?.nombre
+    || null
+  const sumaAseguradaLabel = (() => {
+    const n = Number(planParaPago?.casco?.sumaAsegurada)
+    if (!Number.isFinite(n) || n <= 0) return null
+    const hasDecimals = Math.abs(n % 1) > 1e-9
+    return `$${n.toLocaleString('es-VE', {
+      minimumFractionDigits: hasDecimals ? 2 : 0,
+      maximumFractionDigits: 2,
+    })}`
+  })()
+  const tasaLabel = (() => {
+    const n = Number(planParaPago?.casco?.tasa)
+    if (!Number.isFinite(n) || n < 0) return null
+    return `${String(n.toFixed(2)).replace('.', ',')} %`
+  })()
+  const montoPagarLabel = (() => {
+    const n = Number(
+      planParaPago?.prima?.cuota
+      ?? planParaPago?.prima?.monto
+      ?? planParaPago?.prima?.anual,
+    )
+    if (!Number.isFinite(n) || n <= 0) return null
+    return `$${n.toLocaleString('es-VE', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    })}`
+  })()
+
+  const assertPlanReadyForPayment = () => {
+    if (!planParaPago?.id) {
+      toast.error('Selecciona un plan antes de continuar.', { title: 'Plan requerido' })
+      return false
+    }
+    if (!planParaPago?.casco?.cobertura) {
+      toast.error('Selecciona una cobertura de casco para continuar.', {
+        title: 'Cobertura requerida',
+      })
+      return false
+    }
+    const suma = Number(planParaPago?.casco?.sumaAsegurada)
+    const sumaOk = planParaPago?.casco?.sumaValida === true && Number.isFinite(suma) && suma > 0
+    if (!sumaOk) {
+      setSumaValidationTick((n) => n + 1)
+      toast.error('La suma asegurada es obligatoria y debe ser mayor a 0.', {
+        title: 'Suma asegurada',
+      })
+      return false
+    }
+    if (!planParaPago?.frecuenciaCodigo && !planParaPago?.frecuencia?.cvalor) {
+      toast.error('Selecciona una frecuencia de pago para continuar.', {
+        title: 'Frecuencia requerida',
+      })
+      return false
+    }
+    return true
+  }
 
   // Reanudar borrador tras fallo de pago / redirect
   useEffect(() => {
@@ -151,11 +210,10 @@ export default function InspectionWizardPage() {
 
     let amounts
     try {
-      // TEMP: iframe usa montos de RCVPR2; UI/emisión siguen con el plan elegido
       amounts = await checkoutAmountsForIframe(plan, state.vehiculo)
     } catch (err) {
       setIframeLoading(false)
-      setIframeError(err?.message || 'No se pudo cotizar el plan de prueba para el pago.')
+      setIframeError(err?.message || 'No se pudo cotizar el plan seleccionado para el pago.')
       toast.error(err?.message || 'Error al cotizar plan de pago', { title: 'Pagos' })
       return
     }
@@ -166,7 +224,7 @@ export default function InspectionWizardPage() {
       return
     }
 
-    const ssoKey = `${opId}:${amounts.demoPlanId}:${amounts.totalUsd}:${amounts.totalVes}`
+    const ssoKey = `${opId}:${amounts.planId}:${amounts.totalUsd}:${amounts.totalVes}`
     if (ssoKeyRef.current === ssoKey && iframeUrl) {
       setIframeLoading(false)
       return
@@ -408,14 +466,11 @@ export default function InspectionWizardPage() {
           <button
             type="button"
             onClick={async () => {
-              const plan = planParaPago
-              if (!plan?.id) {
-                toast.error('Selecciona un plan antes de continuar.', {
-                  title: 'Plan requerido',
-                })
+              if (!assertPlanReadyForPayment()) {
                 setConfirmPlanOpen(false)
                 return
               }
+              const plan = planParaPago
               setSelectedPlan(plan)
               try {
                 const saved = await upsertInspectionRecord(
@@ -485,6 +540,46 @@ export default function InspectionWizardPage() {
               </span>
               <span className="text-label-md font-semibold text-on-surface text-right truncate">
                 {frecuenciaLabel}
+              </span>
+            </div>
+          )}
+          {coberturaLabel && (
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-caption text-on-surface-variant font-bold uppercase tracking-wide">
+                Cobertura
+              </span>
+              <span className="text-label-md font-semibold text-on-surface text-right truncate">
+                {coberturaLabel}
+              </span>
+            </div>
+          )}
+          {sumaAseguradaLabel && (
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-caption text-on-surface-variant font-bold uppercase tracking-wide">
+                Suma asegurada
+              </span>
+              <span className="text-label-md font-semibold text-on-surface text-right tabular-nums truncate">
+                {sumaAseguradaLabel}
+              </span>
+            </div>
+          )}
+          {tasaLabel && (
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-caption text-on-surface-variant font-bold uppercase tracking-wide">
+                Tasa
+              </span>
+              <span className="text-label-md font-semibold text-on-surface text-right tabular-nums truncate">
+                {tasaLabel}
+              </span>
+            </div>
+          )}
+          {montoPagarLabel && (
+            <div className="flex items-center justify-between gap-3 pt-1 border-t border-outline-variant/25">
+              <span className="text-caption text-on-surface-variant font-bold uppercase tracking-wide">
+                Monto a pagar
+              </span>
+              <span className="text-label-md font-bold text-primary text-right tabular-nums truncate">
+                {montoPagarLabel}
               </span>
             </div>
           )}
@@ -573,60 +668,6 @@ export default function InspectionWizardPage() {
   }
   const back = () => {
     setStep((s) => Math.max(0, s - 1))
-  }
-
-  /**
-   * TEMP (pruebas locales): avanza a confirmación/emisión.
-   * En server, el redirect del iframe o el notify hacen lo mismo.
-   */
-  const continueAfterPayment = () => {
-    const plan = planParaPago
-    if (!plan?.id) {
-      toast.error('Selecciona un plan antes de continuar.', { title: 'Plan requerido' })
-      return
-    }
-    const opId = idOperacion || buildIdOperacion(inspectionNumber)
-    setIdOperacion(opId)
-    const today = new Date().toISOString().slice(0, 10)
-    saveInspectionDraft({
-      inspectionNumber,
-      step: PAYMENT_STEP,
-      idOperacion: opId,
-      titular: state.titular,
-      tomador: state.tomador,
-      tomadorEsTitular: state.tomadorEsTitular,
-      docs: state.docs,
-      vehiculo: state.vehiculo,
-      ubicacion: state.ubicacion,
-      resultado,
-      selectedPlan: plan,
-      photos: state.photos,
-      checkout: {
-        totalUsd: Number(plan.prima?.cuota ?? plan.prima?.anual ?? plan.prima?.monto ?? 0),
-        totalVes: Number(plan.prima?.mprima ?? 0),
-        label: plan.frecuencia?.xdescripcion || plan.frecuenciaCodigo || 'Anual',
-        localBypass: true,
-        createdAt: new Date().toISOString(),
-      },
-      paymentNotify: {
-        status: 'ok',
-        paymentVerified: true,
-        idOperacion: opId,
-        code: 'ACCP',
-        message: 'Pago verificado',
-        payment: {
-          method: 'mobile',
-          // Formato numérico como Pagos (ej. "219551279300"); en server viene del notify real
-          reference: String(Date.now()).slice(-12).padStart(12, '0'),
-          amount: Number(plan.prima?.mprima ?? plan.prima?.cuota ?? 0),
-          paidOn: today,
-          verifiedOn: today,
-          code: 'ACCP',
-          message: 'Pago verificado',
-        },
-      },
-    })
-    navigate(`/pago/resultado?idOperacion=${encodeURIComponent(opId)}&status=ok`)
   }
 
   // ── Vista de inspección existente ──────────────────────────────────────────
@@ -764,6 +805,7 @@ export default function InspectionWizardPage() {
             valrepPlanesError={state.valrepPlanesError}
             setValrepPlanesError={state.setValrepPlanesError}
             onPlanChange={setSelectedPlan}
+            sumaValidationTick={sumaValidationTick}
           />
         )}
         {step === PAYMENT_STEP && resultado && (
@@ -807,12 +849,7 @@ export default function InspectionWizardPage() {
                 <button
                   type="button"
                   onClick={() => {
-                    if (!planParaPago?.id) {
-                      toast.error('Selecciona un plan antes de continuar.', {
-                        title: 'Plan requerido',
-                      })
-                      return
-                    }
+                    if (!assertPlanReadyForPayment()) return
                     setConfirmPlanOpen(true)
                   }}
                   className="btn-primary flex-1 sm:flex-none"
@@ -830,17 +867,7 @@ export default function InspectionWizardPage() {
                   Ver inspecciones
                 </button>
               )
-            ) : step === PAYMENT_STEP ? (
-              <button
-                type="button"
-                onClick={continueAfterPayment}
-                className="btn-primary flex-1 sm:flex-none"
-                title="Continuar al resultado de pago (pruebas locales de emisión)"
-              >
-                <span className="hidden xs:inline">Siguiente</span>
-                <Icon name="arrow_forward" />
-              </button>
-            ) : (
+            ) : step === PAYMENT_STEP ? null : (
               <button
                 type="button"
                 onClick={next}
